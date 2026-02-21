@@ -1,0 +1,246 @@
+#!/home/lars/.openclaw/workspace/rag/venv/bin/python3
+"""
+rag - Local RAG knowledge base for Lilleklo
+
+Commands:
+  rag add <file|url|-> [source_name]   Add a document (file, URL, or stdin)
+  rag query <question> [n]             Query the knowledge base (default n=5)
+  rag remove <source_name>             Remove a document by source name
+  rag list                             List all ingested sources
+"""
+
+import sys
+import os
+import re
+import hashlib
+from pathlib import Path
+
+DB_PATH = Path.home() / ".openclaw" / "workspace" / "rag" / "db"
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+EMBED_MODEL = "all-MiniLM-L6-v2"
+
+
+def get_collection():
+    import chromadb
+    client = chromadb.PersistentClient(path=str(DB_PATH))
+    return client.get_or_create_collection("knowledge", metadata={"hnsw:space": "cosine"})
+
+
+def get_embedder():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(EMBED_MODEL)
+
+
+def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    chunks = []
+    start = 0
+    text = text.strip()
+    while start < len(text):
+        end = min(start + size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start += size - overlap
+    return chunks
+
+
+def fetch_url(url):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1", errors="replace")
+    # Strip HTML tags and collapse whitespace
+    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL)
+    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.DOTALL)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'&[a-z]+;', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def read_pdf(path):
+    try:
+        import pdfplumber
+    except ImportError:
+        print("ERROR: pdfplumber not installed in venv.", file=sys.stderr)
+        sys.exit(1)
+    with pdfplumber.open(path) as pdf:
+        pages = []
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                pages.append(t)
+    return "\n\n".join(pages)
+
+
+def ingest(text, source_name):
+    if not text.strip():
+        print("ERROR: No text content found.", file=sys.stderr)
+        sys.exit(1)
+
+    chunks = chunk_text(text)
+    if not chunks:
+        print("ERROR: Text produced no chunks.", file=sys.stderr)
+        sys.exit(1)
+
+    embedder = get_embedder()
+    collection = get_collection()
+
+    # Remove any existing chunks for this source
+    try:
+        existing = collection.get(where={"source": source_name})
+        if existing["ids"]:
+            collection.delete(ids=existing["ids"])
+            print(f"Replaced {len(existing['ids'])} existing chunks for '{source_name}'")
+    except Exception:
+        pass
+
+    embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
+    ids = [f"{hashlib.md5(source_name.encode()).hexdigest()[:8]}-chunk-{i}" for i in range(len(chunks))]
+    metadatas = [{"source": source_name, "chunk": i} for i in range(len(chunks))]
+
+    collection.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas)
+    print(f"✓ Added '{source_name}' — {len(chunks)} chunk(s)")
+
+
+def cmd_add(args):
+    if not args:
+        print("Usage: rag add <file|url|-> [source_name]")
+        sys.exit(1)
+
+    source_arg = args[0]
+    source_name = args[1] if len(args) > 1 else None
+
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+
+    if source_arg == "-":
+        text = sys.stdin.read()
+        source_name = source_name or "stdin"
+    elif source_arg.startswith("http://") or source_arg.startswith("https://"):
+        print(f"Fetching {source_arg} ...")
+        text = fetch_url(source_arg)
+        source_name = source_name or source_arg
+    elif os.path.isfile(source_arg):
+        path = Path(source_arg)
+        source_name = source_name or path.name
+        if path.suffix.lower() == ".pdf":
+            print(f"Reading PDF: {path.name} ...")
+            text = read_pdf(path)
+        else:
+            text = path.read_text(errors="replace")
+    else:
+        # Treat as raw text
+        text = source_arg
+        source_name = source_name or f"text-{hashlib.md5(text[:50].encode()).hexdigest()[:8]}"
+
+    ingest(text, source_name)
+
+
+def cmd_query(args):
+    if not args:
+        print("Usage: rag query <question> [n_results]")
+        sys.exit(1)
+
+    # Check if last arg is a number
+    if args[-1].isdigit():
+        n = int(args[-1])
+        question = " ".join(args[:-1])
+    else:
+        n = 5
+        question = " ".join(args)
+
+    embedder = get_embedder()
+    collection = get_collection()
+
+    count = collection.count()
+    if count == 0:
+        print("Knowledge base is empty.")
+        return
+
+    n = min(n, count)
+    q_embedding = embedder.encode([question], show_progress_bar=False).tolist()
+    results = collection.query(query_embeddings=q_embedding, n_results=n)
+
+    if not results["documents"][0]:
+        print("No results found.")
+        return
+
+    for i, (doc, meta, dist) in enumerate(zip(
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0]
+    )):
+        score = 1 - dist
+        print(f"\n--- [{i+1}] {meta['source']} (chunk {meta['chunk']}, relevance: {score:.2f}) ---")
+        print(doc.strip())
+
+
+def cmd_remove(args):
+    if not args:
+        print("Usage: rag remove <source_name>")
+        sys.exit(1)
+
+    source_name = args[0]
+    collection = get_collection()
+
+    existing = collection.get(where={"source": source_name})
+    if not existing["ids"]:
+        print(f"No document found with source '{source_name}'")
+        # Show available sources as hint
+        all_docs = collection.get()
+        if all_docs["ids"]:
+            sources = sorted(set(m["source"] for m in all_docs["metadatas"]))
+            print(f"Available sources: {', '.join(sources)}")
+        sys.exit(1)
+
+    collection.delete(ids=existing["ids"])
+    print(f"✓ Removed '{source_name}' — {len(existing['ids'])} chunk(s) deleted")
+
+
+def cmd_list(args):
+    collection = get_collection()
+    results = collection.get()
+
+    if not results["ids"]:
+        print("Knowledge base is empty.")
+        return
+
+    sources = {}
+    for meta in results["metadatas"]:
+        src = meta["source"]
+        sources[src] = sources.get(src, 0) + 1
+
+    print(f"Knowledge base — {len(sources)} source(s), {len(results['ids'])} total chunk(s):\n")
+    for src, count in sorted(sources.items()):
+        print(f"  {src}  ({count} chunk(s))")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd == "add":
+        cmd_add(args)
+    elif cmd == "query":
+        cmd_query(args)
+    elif cmd == "remove":
+        cmd_remove(args)
+    elif cmd == "list":
+        cmd_list(args)
+    else:
+        print(f"Unknown command: {cmd}")
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
