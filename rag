@@ -13,12 +13,368 @@ import sys
 import os
 import re
 import hashlib
+import logging
 from pathlib import Path
+from html.parser import HTMLParser
+from html import unescape
+from urllib.parse import urlparse
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# Configure logging
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(levelname)s: %(message)s',
+    stream=sys.stderr
+)
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path.home() / ".openclaw" / "workspace" / "rag" / "db"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 EMBED_MODEL = "all-MiniLM-L6-v2"
+
+
+class HTMLTextExtractor(HTMLParser):
+    """
+    Robust HTML to text converter that handles:
+    - Script and style tag removal
+    - HTML entity decoding
+    - Whitespace normalization
+    - Semantic structure preservation (headings, lists, etc.)
+    - Metadata extraction (title, description, heading hierarchy, tables)
+    """
+    def __init__(self):
+        super().__init__()
+        self.text_parts = []
+        self.skip_content = False
+        self.in_pre = False
+        
+        # Metadata extraction (Priority 2.1)
+        self.title = None
+        self.description = None
+        self.current_section = None
+        self.heading_stack = []
+        self.in_title = False
+        self.in_table = False
+        self.table_rows = []
+        self.current_row = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'title':
+            self.in_title = True
+        elif tag == 'meta':
+            attrs_dict = dict(attrs)
+            if attrs_dict.get('name', '').lower() == 'description':
+                self.description = attrs_dict.get('content', '')
+        elif tag in ('script', 'style', 'noscript'):
+            self.skip_content = True
+        elif tag == 'pre':
+            self.in_pre = True
+        elif tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+            if self.text_parts and self.text_parts[-1].strip():
+                self.text_parts.append('\n')
+            # Track heading hierarchy for context
+            level = int(tag[1])
+            self.heading_stack = self.heading_stack[:level-1] + [tag]
+            self.current_section = f"[{' > '.join(self.heading_stack)}] "
+        elif tag in ('p', 'div', 'article', 'section'):
+            if self.text_parts and self.text_parts[-1].strip():
+                self.text_parts.append('\n')
+        elif tag == 'table':
+            self.in_table = True
+            self.table_rows = []
+        elif tag == 'tr' and self.in_table:
+            self.current_row = []
+        elif tag in ('td', 'th') and self.in_table:
+            # Mark cell boundary
+            self.current_row.append('|')
+        elif tag in ('li', 'dd'):
+            if self.text_parts and self.text_parts[-1].strip():
+                self.text_parts.append(' • ')
+        elif tag == 'br':
+            self.text_parts.append('\n')
+        elif tag == 'figcaption':
+            if self.text_parts and self.text_parts[-1].strip():
+                self.text_parts.append('\n[Caption] ')
+
+    def handle_endtag(self, tag):
+        if tag == 'title':
+            self.in_title = False
+        elif tag in ('script', 'style', 'noscript', 'meta'):
+            self.skip_content = False
+        elif tag == 'pre':
+            self.in_pre = False
+        elif tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+            if self.text_parts and self.text_parts[-1].strip():
+                self.text_parts.append('\n')
+        elif tag in ('p', 'div', 'article', 'section'):
+            if self.text_parts and self.text_parts[-1].strip():
+                self.text_parts.append('\n')
+        elif tag == 'table':
+            self.in_table = False
+            # Convert table rows to readable text
+            if self.table_rows:
+                self.text_parts.append('\n[Table]\n')
+                for row in self.table_rows:
+                    self.text_parts.append(' | '.join(row).strip() + '\n')
+                self.text_parts.append('\n')
+        elif tag == 'tr' and self.in_table and self.current_row:
+            self.table_rows.append(self.current_row)
+            self.current_row = []
+
+    def handle_data(self, data):
+        if not self.skip_content:
+            if self.in_table and self.current_row is not None:
+                self.current_row.append(data.strip())
+            else:
+                self.text_parts.append(data)
+            
+            # Extract page title
+            if self.in_title and not self.title:
+                self.title = data.strip()
+
+    def handle_entityref(self, name):
+        if not self.skip_content:
+            try:
+                decoded = chr(int(name)) if name.isdigit() else unescape(f'&{name};')
+                if self.in_table and self.current_row is not None:
+                    self.current_row.append(decoded)
+                else:
+                    self.text_parts.append(decoded)
+            except (ValueError, OverflowError):
+                logger.debug(f"Failed to decode entity: {name}")
+                if self.in_table and self.current_row is not None:
+                    self.current_row.append(f'&{name};')
+                else:
+                    self.text_parts.append(f'&{name};')
+
+    def handle_charref(self, name):
+        if not self.skip_content:
+            try:
+                decoded = chr(int(name, 16 if name.startswith('x') else 10))
+                if self.in_table and self.current_row is not None:
+                    self.current_row.append(decoded)
+                else:
+                    self.text_parts.append(decoded)
+            except (ValueError, OverflowError):
+                logger.debug(f"Failed to decode character ref: {name}")
+                if self.in_table and self.current_row is not None:
+                    self.current_row.append(f'&#{name};')
+                else:
+                    self.text_parts.append(f'&#{name};')
+
+    def get_text(self):
+        text = ''.join(self.text_parts)
+        # Normalize whitespace
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        return text
+    
+    def get_metadata(self):
+        """Return extracted metadata as dict (Priority 2.1)"""
+        return {
+            'title': self.title,
+            'description': self.description
+        }
+
+
+def validate_url(url):
+    """
+    Validate URL format before fetching.
+    Returns (is_valid, error_message)
+    """
+    if not url:
+        return False, "URL cannot be empty"
+    
+    if not (url.startswith('http://') or url.startswith('https://')):
+        return False, "URL must start with http:// or https://"
+    
+    try:
+        result = urlparse(url)
+        if not result.netloc:
+            return False, "URL missing domain/host"
+        if not result.scheme:
+            return False, "URL missing scheme (http/https)"
+        return True, None
+    except Exception as e:
+        return False, f"Invalid URL: {str(e)}"
+
+
+def normalize_text(text):
+    """
+    Normalize text by cleaning up whitespace, removing boilerplate, and validating quality.
+    Priority 2.3 implementation.
+    
+    Args:
+        text: Raw text to normalize
+    
+    Returns:
+        Cleaned text suitable for embedding
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    
+    # Normalize whitespace: collapse multiple spaces and newlines
+    text = re.sub(r' +', ' ', text)  # Multiple spaces to single
+    text = re.sub(r'\n\n+', '\n', text)  # Multiple newlines to single
+    text = re.sub(r'[ \t]+\n', '\n', text)  # Trailing spaces before newlines
+    
+    # Remove common boilerplate patterns (navigation, CTAs, etc.)
+    boilerplate_patterns = [
+        r'(?i)subscribe\s+(?:to|for|our|the)',
+        r'(?i)(?:sign\s+up|subscribe|follow|share)\s+(?:on|for|to)',
+        r'(?i)(?:copy)?right\s*©?.*?\d{4}',
+        r'(?i)(?:terms?\s+(?:of\s+)?(?:use|service)|privacy\s+policy)',
+        r'(?i)cookie\s+(?:policy|notice|settings)',
+        r'(?i)(?:contact\s+)(?:us|me|support)',
+        r'(?i)(?:go\s+to\s+)?(?:skip\s+to\s+)?(?:main\s+)?content',
+        r'(?i)(?:read\s+)?(?:more|less)',
+        r'(?i)(?:back\s+to\s+)?(?:top|home)',
+    ]
+    
+    for pattern in boilerplate_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
+    # Detect corrupted/garbled text (encoding artifacts)
+    # Look for excessive control characters or replacement characters
+    control_char_ratio = sum(1 for c in text if ord(c) < 32 and c not in '\n\t\r') / max(len(text), 1)
+    if control_char_ratio > 0.05:
+        logger.warning(f"Text contains {control_char_ratio:.1%} control characters (may be corrupted)")
+    
+    replacement_char_ratio = text.count('\ufffd') / max(len(text), 1)
+    if replacement_char_ratio > 0.02:
+        logger.warning(f"Text contains {replacement_char_ratio:.1%} replacement characters (encoding issues)")
+    
+    # Remove consecutive duplicate lines (but keep intentional repetition)
+    lines = text.split('\n')
+    deduplicated = []
+    prev_line = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped and stripped != prev_line:
+            deduplicated.append(line)
+            prev_line = stripped
+    
+    text = '\n'.join(deduplicated)
+    text = text.strip()
+    
+    return text
+
+
+def semantic_chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """
+    Chunk text at semantic boundaries (paragraphs/sentences) rather than fixed character positions.
+    Priority 2.2 implementation.
+    
+    Args:
+        text: Text to chunk
+        size: Target chunk size in characters
+        overlap: Overlap between chunks in characters
+    
+    Returns:
+        List of text chunks with sensible boundaries
+    """
+    if not text.strip():
+        return []
+    
+    # Split into paragraphs first (semantic boundaries)
+    paragraphs = re.split(r'\n\n+', text)
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    
+    if not paragraphs:
+        return []
+    
+    chunks = []
+    current_chunk = ""
+    
+    for para in paragraphs:
+        # If single paragraph is larger than size, chunk it at sentence boundaries
+        if len(para) > size:
+            sentences = re.split(r'(?<=[.!?])\s+', para)
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                    
+                # Add sentence to current chunk if it fits
+                test_chunk = current_chunk + (' ' if current_chunk else '') + sentence
+                
+                if len(test_chunk) <= size:
+                    current_chunk = test_chunk
+                else:
+                    # Current chunk is full, save it and start new one
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                        # Create overlap for next chunk
+                        overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                        current_chunk = overlap_text + (' ' if overlap_text else '') + sentence
+                    else:
+                        # Single sentence is larger than chunk size
+                        current_chunk = sentence
+        else:
+            # Paragraph fits in chunk
+            test_chunk = current_chunk + ('\n\n' if current_chunk else '') + para
+            
+            if len(test_chunk) <= size:
+                current_chunk = test_chunk
+            else:
+                # Save current chunk and start new one
+                if current_chunk:
+                    chunks.append(current_chunk)
+                    # Create overlap
+                    overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                    current_chunk = overlap_text + '\n\n' + para
+                else:
+                    current_chunk = para
+    
+    # Add remaining chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk)
+    
+    logger.info(f"Created {len(chunks)} semantic chunks from text (avg size: {sum(len(c) for c in chunks) // max(len(chunks), 1) if chunks else 0} chars)")
+    
+    return chunks
+
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((OSError, TimeoutError, ConnectionError)),
+    reraise=True
+)
+def fetch_url_with_retry(url):
+    """
+    Fetch URL with retry logic for transient failures.
+    Raises: OSError, TimeoutError, or ConnectionError on persistent failure.
+    """
+    import urllib.request
+    import urllib.error
+    
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            # Check content type
+            content_type = resp.headers.get('Content-Type', '').lower()
+            if content_type.startswith('application/pdf'):
+                logger.warning(f"URL appears to be PDF, not HTML: {url}")
+            elif content_type and not any(x in content_type for x in ['text/html', 'text/plain', 'application/xhtml']):
+                logger.warning(f"Unexpected content type {content_type} for {url}")
+            
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 403, 410):
+            # Permanent errors - don't retry
+            raise OSError(f"HTTP {e.code}: {e.reason}") from e
+        # Temporary errors - let retry decorator handle
+        raise ConnectionError(f"HTTP {e.code}: {e.reason}") from e
+    except urllib.error.URLError as e:
+        # Network errors - retry
+        raise ConnectionError(f"URL Error: {e.reason}") from e
 
 
 def get_collection():
@@ -33,82 +389,206 @@ def get_embedder():
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    chunks = []
-    start = 0
-    text = text.strip()
-    while start < len(text):
-        end = min(start + size, len(text))
-        chunks.append(text[start:end])
-        if end == len(text):
-            break
-        start += size - overlap
-    return chunks
+    """
+    Chunk text using semantic boundaries (Priority 2.2).
+    Now uses paragraph and sentence boundaries instead of fixed character positions.
+    
+    Args:
+        text: Text to chunk
+        size: Target chunk size
+        overlap: Overlap between chunks
+    
+    Returns:
+        List of text chunks
+    """
+    return semantic_chunk_text(text, size, overlap)
 
 
 def fetch_url(url):
-    import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        raw = resp.read()
+    """
+    Fetch and parse HTML from URL with robust error handling.
+    
+    Args:
+        url: URL to fetch
+    
+    Returns:
+        Extracted plain text from HTML
+        
+    Raises:
+        SystemExit on validation or persistent fetch errors
+    """
+    # Validate URL
+    is_valid, error_msg = validate_url(url)
+    if not is_valid:
+        logger.error(f"URL validation failed: {error_msg}")
+        print(f"ERROR: {error_msg}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Fetch with retry logic
+    try:
+        logger.info(f"Fetching URL: {url}")
+        raw = fetch_url_with_retry(url)
+    except OSError as e:
+        # Permanent HTTP errors (404, 403, etc.)
+        print(f"ERROR: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+    except (ConnectionError, TimeoutError) as e:
+        # Transient failures after all retries exhausted
+        print(f"ERROR: Failed to fetch URL after retries: {str(e)}", file=sys.stderr)
+        logger.exception("Retries exhausted for URL fetch")
+        sys.exit(1)
+    except Exception as e:
+        # Unexpected errors
+        print(f"ERROR: Unexpected error fetching URL: {str(e)}", file=sys.stderr)
+        logger.exception("Unexpected error during URL fetch")
+        sys.exit(1)
+    
+    # Decode with fallback
     try:
         text = raw.decode("utf-8")
+        logger.info("Decoded HTML as UTF-8")
     except UnicodeDecodeError:
-        text = raw.decode("latin-1", errors="replace")
-    # Strip HTML tags and collapse whitespace
-    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL)
-    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.DOTALL)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'&[a-z]+;', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
+        try:
+            text = raw.decode("utf-8", errors="replace")
+            logger.warning("UTF-8 decode with error replacement (some characters may be corrupted)")
+        except Exception as e:
+            text = raw.decode("latin-1", errors="replace")
+            logger.warning(f"Fell back to latin-1 decoding: {str(e)}")
+    
+    # Extract text from HTML
+    try:
+        extractor = HTMLTextExtractor()
+        extractor.feed(text)
+        text = extractor.get_text()
+        if not text:
+            logger.warning(f"HTML parsing produced empty text from {url}")
+        logger.info(f"Successfully extracted {len(text)} characters from HTML")
+    except Exception as e:
+        logger.error(f"HTML parsing failed: {str(e)}")
+        print(f"ERROR: Failed to parse HTML: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+    
     return text
 
 
 def read_pdf(path):
+    """
+    Extract text from PDF file.
+    
+    Args:
+        path: Path to PDF file
+    
+    Returns:
+        Extracted text from all pages
+    """
     try:
         import pdfplumber
     except ImportError:
+        logger.error("pdfplumber not installed in venv")
         print("ERROR: pdfplumber not installed in venv.", file=sys.stderr)
         sys.exit(1)
-    with pdfplumber.open(path) as pdf:
-        pages = []
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                pages.append(t)
-    return "\n\n".join(pages)
+    
+    try:
+        with pdfplumber.open(path) as pdf:
+            pages = []
+            for i, page in enumerate(pdf.pages):
+                try:
+                    t = page.extract_text()
+                    if t and t.strip():
+                        pages.append(t)
+                except Exception as e:
+                    logger.warning(f"Failed to extract page {i}: {str(e)}")
+            
+            if not pages:
+                logger.warning(f"PDF {path} produced no extractable text")
+            else:
+                logger.info(f"Extracted {len(pages)} pages from {path}")
+            
+            return "\n\n".join(pages)
+    except Exception as e:
+        logger.error(f"Failed to open or read PDF {path}: {str(e)}")
+        print(f"ERROR: Failed to read PDF: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 
 def ingest(text, source_name):
+    """
+    Ingest text into the knowledge base.
+    
+    Applies text normalization (Priority 2.3) and semantic chunking (Priority 2.2).
+    
+    Args:
+        text: Text content to ingest
+        source_name: Source identifier for tracking
+    """
     if not text.strip():
+        logger.error("No text content to ingest")
         print("ERROR: No text content found.", file=sys.stderr)
         sys.exit(1)
 
-    chunks = chunk_text(text)
-    if not chunks:
-        print("ERROR: Text produced no chunks.", file=sys.stderr)
+    # Normalize text (Priority 2.3)
+    logger.info(f"Normalizing text ({len(text)} chars)")
+    text = normalize_text(text)
+    
+    if not text.strip():
+        logger.error("Text normalization produced empty result")
+        print("ERROR: Text is empty after normalization.", file=sys.stderr)
         sys.exit(1)
 
-    embedder = get_embedder()
-    collection = get_collection()
+    # Semantic chunking (Priority 2.2)
+    chunks = chunk_text(text)
+    if not chunks:
+        logger.error("Text produced no chunks after splitting")
+        print("ERROR: Text produced no chunks.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Filter empty/short chunks (Priority 2.3)
+    min_chunk_size = 50
+    chunks = [c for c in chunks if len(c.strip()) >= min_chunk_size]
+    if not chunks:
+        logger.error(f"No chunks exceeded minimum size ({min_chunk_size} chars)")
+        print(f"ERROR: Text too short for chunking (minimum {min_chunk_size} chars).", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        embedder = get_embedder()
+        collection = get_collection()
+    except Exception as e:
+        logger.error(f"Failed to initialize embedder or collection: {str(e)}")
+        print(f"ERROR: Failed to initialize RAG components: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
     # Remove any existing chunks for this source
     try:
         existing = collection.get(where={"source": source_name})
         if existing["ids"]:
             collection.delete(ids=existing["ids"])
+            logger.info(f"Replaced {len(existing['ids'])} existing chunks for '{source_name}'")
             print(f"Replaced {len(existing['ids'])} existing chunks for '{source_name}'")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to check for existing chunks: {str(e)}")
 
-    embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
-    ids = [f"{hashlib.md5(source_name.encode()).hexdigest()[:8]}-chunk-{i}" for i in range(len(chunks))]
-    metadatas = [{"source": source_name, "chunk": i} for i in range(len(chunks))]
-
-    collection.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas)
-    print(f"✓ Added '{source_name}' — {len(chunks)} chunk(s)")
+    # Generate embeddings and store
+    try:
+        logger.info(f"Generating embeddings for {len(chunks)} chunks")
+        embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
+        ids = [f"{hashlib.md5(source_name.encode()).hexdigest()[:8]}-chunk-{i}" for i in range(len(chunks))]
+        metadatas = [{"source": source_name, "chunk": i} for i in range(len(chunks))]
+        
+        collection.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas)
+        logger.info(f"Successfully ingested '{source_name}' with {len(chunks)} chunks")
+        print(f"✓ Added '{source_name}' — {len(chunks)} chunk(s)")
+    except Exception as e:
+        logger.error(f"Failed to add documents to collection: {str(e)}")
+        print(f"ERROR: Failed to add documents to knowledge base: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_add(args):
+    """
+    Add a document to the knowledge base.
+    Supports files (PDF, text), URLs, stdin, or raw text.
+    """
     if not args:
         print("Usage: rag add <file|url|-> [source_name]")
         sys.exit(1)
@@ -116,32 +596,73 @@ def cmd_add(args):
     source_arg = args[0]
     source_name = args[1] if len(args) > 1 else None
 
-    DB_PATH.mkdir(parents=True, exist_ok=True)
+    try:
+        DB_PATH.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Failed to create database directory: {str(e)}")
+        print(f"ERROR: Failed to create database directory: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
-    if source_arg == "-":
-        text = sys.stdin.read()
-        source_name = source_name or "stdin"
-    elif source_arg.startswith("http://") or source_arg.startswith("https://"):
-        print(f"Fetching {source_arg} ...")
-        text = fetch_url(source_arg)
-        source_name = source_name or source_arg
-    elif os.path.isfile(source_arg):
-        path = Path(source_arg)
-        source_name = source_name or path.name
-        if path.suffix.lower() == ".pdf":
-            print(f"Reading PDF: {path.name} ...")
-            text = read_pdf(path)
+    try:
+        if source_arg == "-":
+            logger.info("Reading from stdin")
+            text = sys.stdin.read()
+            source_name = source_name or "stdin"
+        elif source_arg.startswith("http://") or source_arg.startswith("https://"):
+            print(f"Fetching {source_arg} ...")
+            text = fetch_url(source_arg)
+            source_name = source_name or source_arg
+        elif os.path.isfile(source_arg):
+            path = Path(source_arg)
+            source_name = source_name or path.name
+            if path.suffix.lower() == ".pdf":
+                print(f"Reading PDF: {path.name} ...")
+                text = read_pdf(path)
+            elif path.suffix.lower() in (".html", ".htm"):
+                try:
+                    logger.info(f"Reading HTML file: {path}")
+                    raw_html = path.read_text(errors="replace")
+                    extractor = HTMLTextExtractor()
+                    extractor.feed(raw_html)
+                    text = extractor.get_text()
+                    if not text:
+                        logger.warning(f"HTML file {path.name} produced no extractable text")
+                    logger.info(f"Extracted {len(text)} chars from HTML file")
+                except Exception as e:
+                    logger.error(f"Failed to parse HTML file {path}: {str(e)}")
+                    print(f"ERROR: Failed to parse HTML file: {str(e)}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                try:
+                    logger.info(f"Reading text file: {path}")
+                    text = path.read_text(errors="replace")
+                except Exception as e:
+                    logger.error(f"Failed to read file {path}: {str(e)}")
+                    print(f"ERROR: Failed to read file: {str(e)}", file=sys.stderr)
+                    sys.exit(1)
         else:
-            text = path.read_text(errors="replace")
-    else:
-        # Treat as raw text
-        text = source_arg
-        source_name = source_name or f"text-{hashlib.md5(text[:50].encode()).hexdigest()[:8]}"
+            # Treat as raw text
+            logger.info(f"Processing raw text input ({len(source_arg)} chars)")
+            text = source_arg
+            source_name = source_name or f"text-{hashlib.md5(text[:50].encode()).hexdigest()[:8]}"
 
-    ingest(text, source_name)
+        ingest(text, source_name)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)  # Standard exit code for SIGINT
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.exception(f"Unexpected error in cmd_add: {str(e)}")
+        print(f"ERROR: Unexpected error: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_query(args):
+    """
+    Query the knowledge base for relevant documents.
+    """
     if not args:
         print("Usage: rag query <question> [n_results]")
         sys.exit(1)
@@ -154,59 +675,100 @@ def cmd_query(args):
         n = 5
         question = " ".join(args)
 
-    embedder = get_embedder()
-    collection = get_collection()
+    try:
+        embedder = get_embedder()
+        collection = get_collection()
+    except Exception as e:
+        logger.error(f"Failed to initialize embedder or collection: {str(e)}")
+        print(f"ERROR: Failed to initialize RAG components: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
-    count = collection.count()
-    if count == 0:
-        print("Knowledge base is empty.")
-        return
+    try:
+        count = collection.count()
+        if count == 0:
+            logger.info("Knowledge base is empty")
+            print("Knowledge base is empty.")
+            return
 
-    n = min(n, count)
-    q_embedding = embedder.encode([question], show_progress_bar=False).tolist()
-    results = collection.query(query_embeddings=q_embedding, n_results=n)
+        n = min(n, count)
+        logger.info(f"Querying with question: {question[:50]}... (n={n})")
+        q_embedding = embedder.encode([question], show_progress_bar=False).tolist()
+        results = collection.query(query_embeddings=q_embedding, n_results=n)
 
-    if not results["documents"][0]:
-        print("No results found.")
-        return
+        if not results["documents"][0]:
+            logger.info("No results found for query")
+            print("No results found.")
+            return
 
-    for i, (doc, meta, dist) in enumerate(zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0]
-    )):
-        score = 1 - dist
-        print(f"\n--- [{i+1}] {meta['source']} (chunk {meta['chunk']}, relevance: {score:.2f}) ---")
-        print(doc.strip())
+        for i, (doc, meta, dist) in enumerate(zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0]
+        )):
+            score = 1 - dist
+            print(f"\n--- [{i+1}] {meta['source']} (chunk {meta['chunk']}, relevance: {score:.2f}) ---")
+            print(doc.strip())
+    except Exception as e:
+        logger.error(f"Query execution failed: {str(e)}")
+        print(f"ERROR: Query failed: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_remove(args):
+    """
+    Remove a document from the knowledge base by source name.
+    """
     if not args:
         print("Usage: rag remove <source_name>")
         sys.exit(1)
 
     source_name = args[0]
-    collection = get_collection()
-
-    existing = collection.get(where={"source": source_name})
-    if not existing["ids"]:
-        print(f"No document found with source '{source_name}'")
-        # Show available sources as hint
-        all_docs = collection.get()
-        if all_docs["ids"]:
-            sources = sorted(set(m["source"] for m in all_docs["metadatas"]))
-            print(f"Available sources: {', '.join(sources)}")
+    
+    try:
+        collection = get_collection()
+    except Exception as e:
+        logger.error(f"Failed to initialize collection: {str(e)}")
+        print(f"ERROR: Failed to initialize RAG components: {str(e)}", file=sys.stderr)
         sys.exit(1)
 
-    collection.delete(ids=existing["ids"])
-    print(f"✓ Removed '{source_name}' — {len(existing['ids'])} chunk(s) deleted")
+    try:
+        existing = collection.get(where={"source": source_name})
+        if not existing["ids"]:
+            logger.warning(f"No document found with source '{source_name}'")
+            print(f"No document found with source '{source_name}'")
+            # Show available sources as hint
+            try:
+                all_docs = collection.get()
+                if all_docs["ids"]:
+                    sources = sorted(set(m["source"] for m in all_docs["metadatas"]))
+                    print(f"Available sources: {', '.join(sources)}")
+            except Exception as e:
+                logger.debug(f"Failed to list available sources: {str(e)}")
+            sys.exit(1)
+
+        collection.delete(ids=existing["ids"])
+        logger.info(f"Removed {len(existing['ids'])} chunks for source '{source_name}'")
+        print(f"✓ Removed '{source_name}' — {len(existing['ids'])} chunk(s) deleted")
+    except Exception as e:
+        logger.error(f"Failed to remove source: {str(e)}")
+        print(f"ERROR: Failed to remove source: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_list(args):
-    collection = get_collection()
-    results = collection.get()
+    """
+    List all documents in the knowledge base.
+    """
+    try:
+        collection = get_collection()
+        results = collection.get()
+    except Exception as e:
+        logger.error(f"Failed to initialize collection: {str(e)}")
+        print(f"ERROR: Failed to initialize RAG components: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
     if not results["ids"]:
+        logger.info("Knowledge base is empty")
         print("Knowledge base is empty.")
         return
 
@@ -215,6 +777,7 @@ def cmd_list(args):
         src = meta["source"]
         sources[src] = sources.get(src, 0) + 1
 
+    logger.info(f"Listed {len(sources)} sources with {len(results['ids'])} total chunks")
     print(f"Knowledge base — {len(sources)} source(s), {len(results['ids'])} total chunk(s):\n")
     for src, count in sorted(sources.items()):
         print(f"  {src}  ({count} chunk(s))")
