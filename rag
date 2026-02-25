@@ -511,16 +511,19 @@ def read_pdf(path):
         sys.exit(1)
 
 
-def ingest(text, source_name):
+def ingest(text, source_name, extra_meta=None):
     """
     Ingest text into the knowledge base.
-    
+
     Applies text normalization (Priority 2.3) and semantic chunking (Priority 2.2).
-    
+
     Args:
         text: Text content to ingest
         source_name: Source identifier for tracking
+        extra_meta: Optional dict of extra metadata to store on each chunk (e.g. file_path)
     """
+    if extra_meta is None:
+        extra_meta = {}
     if not text.strip():
         logger.error("No text content to ingest")
         print("ERROR: No text content found.", file=sys.stderr)
@@ -573,7 +576,7 @@ def ingest(text, source_name):
         logger.info(f"Generating embeddings for {len(chunks)} chunks")
         embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
         ids = [f"{hashlib.md5(source_name.encode()).hexdigest()[:8]}-chunk-{i}" for i in range(len(chunks))]
-        metadatas = [{"source": source_name, "chunk": i} for i in range(len(chunks))]
+        metadatas = [{"source": source_name, "chunk": i, **extra_meta} for i in range(len(chunks))]
         
         collection.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas)
         logger.info(f"Successfully ingested '{source_name}' with {len(chunks)} chunks")
@@ -603,6 +606,8 @@ def cmd_add(args):
         print(f"ERROR: Failed to create database directory: {str(e)}", file=sys.stderr)
         sys.exit(1)
 
+    extra_meta = {}
+
     try:
         if source_arg == "-":
             logger.info("Reading from stdin")
@@ -613,8 +618,9 @@ def cmd_add(args):
             text = fetch_url(source_arg)
             source_name = source_name or source_arg
         elif os.path.isfile(source_arg):
-            path = Path(source_arg)
+            path = Path(source_arg).resolve()
             source_name = source_name or path.name
+            extra_meta["file_path"] = str(path)
             if path.suffix.lower() == ".pdf":
                 print(f"Reading PDF: {path.name} ...")
                 text = read_pdf(path)
@@ -646,7 +652,7 @@ def cmd_add(args):
             text = source_arg
             source_name = source_name or f"text-{hashlib.md5(text[:50].encode()).hexdigest()[:8]}"
 
-        ingest(text, source_name)
+        ingest(text, source_name, extra_meta)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         print("\nInterrupted.", file=sys.stderr)
@@ -716,14 +722,19 @@ def cmd_query(args):
 
 def cmd_remove(args):
     """
-    Remove a document from the knowledge base by source name.
+    Remove a document from the knowledge base and optionally trash the source file.
+
+    Usage:
+      rag remove <source_name>             Remove from RAG + trash source file
+      rag remove <source_name> --keep-file  Remove from RAG only, keep file on disk
     """
     if not args:
-        print("Usage: rag remove <source_name>")
+        print("Usage: rag remove <source_name> [--keep-file]")
         sys.exit(1)
 
-    source_name = args[0]
-    
+    keep_file = "--keep-file" in args
+    source_name = [a for a in args if not a.startswith("--")][0]
+
     try:
         collection = get_collection()
     except Exception as e:
@@ -736,7 +747,6 @@ def cmd_remove(args):
         if not existing["ids"]:
             logger.warning(f"No document found with source '{source_name}'")
             print(f"No document found with source '{source_name}'")
-            # Show available sources as hint
             try:
                 all_docs = collection.get()
                 if all_docs["ids"]:
@@ -746,9 +756,32 @@ def cmd_remove(args):
                 logger.debug(f"Failed to list available sources: {str(e)}")
             sys.exit(1)
 
+        # Extract file_path from metadata before deleting
+        file_path = None
+        for meta in existing["metadatas"]:
+            if meta.get("file_path"):
+                file_path = meta["file_path"]
+                break
+
         collection.delete(ids=existing["ids"])
-        logger.info(f"Removed {len(existing['ids'])} chunks for source '{source_name}'")
-        print(f"✓ Removed '{source_name}' — {len(existing['ids'])} chunk(s) deleted")
+        n_chunks = len(existing['ids'])
+        logger.info(f"Removed {n_chunks} chunks for source '{source_name}'")
+
+        # Trash the source file if it exists
+        if not keep_file and file_path and os.path.isfile(file_path):
+            import subprocess
+            result = subprocess.run(["gio", "trash", file_path], capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"✓ Removed '{source_name}' — {n_chunks} chunk(s) + trashed {file_path}")
+            else:
+                print(f"✓ Removed '{source_name}' — {n_chunks} chunk(s) deleted from RAG")
+                print(f"⚠ Failed to trash file: {result.stderr.strip()}")
+        elif not keep_file and file_path and not os.path.isfile(file_path):
+            print(f"✓ Removed '{source_name}' — {n_chunks} chunk(s) (file already gone: {file_path})")
+        elif keep_file:
+            print(f"✓ Removed '{source_name}' — {n_chunks} chunk(s) deleted (file kept)")
+        else:
+            print(f"✓ Removed '{source_name}' — {n_chunks} chunk(s) deleted")
     except Exception as e:
         logger.error(f"Failed to remove source: {str(e)}")
         print(f"ERROR: Failed to remove source: {str(e)}", file=sys.stderr)
